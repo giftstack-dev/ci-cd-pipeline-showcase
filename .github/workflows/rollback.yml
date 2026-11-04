@@ -1,0 +1,108 @@
+# Pin to full commit SHAs in a production environment
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: 'Target deployment environment to rollback'
+        required: true
+        options:
+          - staging
+          - production
+      image_tag:
+        type: string
+        description: 'Target image tag or commit SHA to restore (e.g., 0.9.4 or 7f9c2d1)'
+        required: true
+
+# Note: This rollback mechanism assumes the hosting provider (e.g., Render, Fly.io, Kubernetes, ECS)
+# supports deploying a specific image tag either by appending query parameters to the deploy hook URL
+# (e.g. ?image_tag=xyz) or via container image registry webhook payloads.
+
+concurrency:
+  group: rollback-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    name: Execute Rollback (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Inspect rollback target
+        run: |
+          echo "Target Environment: ${{ github.event.inputs.environment }}"
+          echo "Target Image Tag: ${{ github.event.inputs.image_tag }}"
+
+      - name: Trigger rollback webhook and verify health
+        env:
+          TARGET_ENV: ${{ github.event.inputs.environment }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          STAGING_HOOK: ${{ secrets.STAGING_DEPLOY_HOOK_URL }}
+          PROD_HOOK: ${{ secrets.PRODUCTION_DEPLOY_HOOK_URL }}
+          STAGING_API: ${{ vars.STAGING_API_URL }}
+          PROD_API: ${{ vars.PRODUCTION_API_URL }}
+        run: |
+          # Determine environment-specific deploy hook and API URL
+          if [ "$TARGET_ENV" = "production" ]; then
+            DEPLOY_HOOK="$PROD_HOOK"
+            API_URL="$PROD_API"
+          else
+            DEPLOY_HOOK="$STAGING_HOOK"
+            API_URL="$STAGING_API"
+          fi
+
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "Rollback skipped: No deploy hook configured for $TARGET_ENV environment."
+            echo "### ℹ️ Rollback Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "Rollback to tag \`$IMAGE_TAG\` for **$TARGET_ENV** was not executed because the corresponding deploy hook secret is not configured." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "Invoking rollback deploy hook with image tag $IMAGE_TAG..."
+          # Pass image_tag as query param or JSON payload if supported by provider
+          curl -s -f -X POST "$DEPLOY_HOOK?image_tag=$IMAGE_TAG" || curl -s -f -X POST "$DEPLOY_HOOK"
+
+          if [ -z "$API_URL" ]; then
+            echo "API URL not configured; skipping health verification."
+            exit 0
+          fi
+
+          echo "Awaiting health check recovery from $API_URL/health..."
+          ATTEMPT=0
+          MAX_ATTEMPTS=8
+          DELAY=15
+          SUCCESS=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT: Checking $API_URL/health..."
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Service successfully restored and responding with HTTP 200!"
+              SUCCESS=1
+              break
+            fi
+            sleep $DELAY
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "❌ Service failed health check after rollback."
+            exit 1
+          fi
+
+      - name: Write Rollback Step Summary
+        if: always()
+        run: |
+          echo "## 🔄 Rollback Execution Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ github.event.inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target Image Tag** | \`${{ github.event.inputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered By** | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | Completed |" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,6 @@
+{
+  "name": "CI/CD Pipeline Showcase",
+  "description": "Automated end-to-end CI/CD pipeline showcase with GitHub Actions, FastAPI backend, React dashboard, container scanning, and multi-environment deployment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

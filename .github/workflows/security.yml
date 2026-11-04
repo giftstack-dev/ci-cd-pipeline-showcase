@@ -1,0 +1,134 @@
+# Pin to full commit SHAs in a production environment
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run weekly security audit every Monday at 03:00 UTC
+    - cron: '0 3 * * 1'
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ========================================================
+  # Job: CodeQL Static Application Security Testing (SAST)
+  # Deep code analysis detecting CWE vulnerabilities across languages
+  # ========================================================
+  codeql:
+    name: CodeQL Analysis (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript-typescript', 'python']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-extended,security-and-quality
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ========================================================
+  # Job: Dependency Review
+  # Gates pull requests introducing high-risk vulnerable packages
+  # ========================================================
+  dependency-review:
+    name: Dependency Review (PR Gate)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run GitHub Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  # ========================================================
+  # Job: Python Package Audit
+  # Scans backend requirements against PyPI advisory database
+  # ========================================================
+  python-audit:
+    name: Python Audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.7.3
+
+      - name: Run pip-audit on backend dependencies
+        run: pip-audit -r backend/requirements.txt
+
+  # ========================================================
+  # Job: NPM Package Audit
+  # Validates frontend dependencies against known CVE advisories
+  # ========================================================
+  npm-audit:
+    name: NPM Audit (frontend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run npm audit
+        working-directory: frontend
+        # Fails only on high or critical vulnerabilities
+        run: npm audit --audit-level=high
+
+  # ========================================================
+  # Job: Secret & Credential Scanning
+  # Gitleaks scans git history and working tree for leaked keys
+  # Note: Gitleaks action runs without license on personal & open-source repos
+  # ========================================================
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository with full commit history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

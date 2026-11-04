@@ -1,0 +1,8 @@
+# Global repository code owner
+* @giftstack-dev
+
+# Pipeline workflows
+/.github/workflows/ @giftstack-dev
+/backend/ @giftstack-dev
+/frontend/ @giftstack-dev
+/docs/ @giftstack-dev

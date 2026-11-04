@@ -1,0 +1,238 @@
+# Pin to full commit SHAs in a production environment
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Queue deployment runs sequentially without canceling in-progress deployments
+concurrency:
+  group: deploy-staging-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: giftstack-dev/ci-cd-pipeline-showcase-backend
+
+jobs:
+  # ========================================================
+  # Job: Build, Scan & Push Backend Container Image
+  # Injects build provenance args, caches layers in GHA,
+  # publishes to GitHub Container Registry, and runs Trivy scan
+  # ========================================================
+  build-image:
+    name: Build & Scan Container Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      version: ${{ steps.meta-info.outputs.version }}
+      short_sha: ${{ steps.meta-info.outputs.short_sha }}
+      image_tag: ${{ steps.meta-info.outputs.image_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract metadata and version from repository
+        id: meta-info
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata extraction
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.meta-info.outputs.short_sha }}
+            type=raw,value=main
+            type=raw,value=${{ steps.meta-info.outputs.version }}
+
+      - name: Build and push backend Docker image
+        id: docker-build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta-info.outputs.version }}
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta-info.outputs.build_time }}
+            APP_ENV=staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan container image with Trivy (Vulnerability Scanner)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ steps.meta-info.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF results to Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-container'
+
+  # ========================================================
+  # Job: Deploy Frontend Dashboard to GitHub Pages
+  # Injects build provenance and staging API URL, compiles bundle,
+  # and serves static site via official GitHub Pages actions
+  # ========================================================
+  deploy-frontend:
+    name: Deploy Frontend (GitHub Pages)
+    needs: [build-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: frontend/package.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend bundle with provenance
+        working-directory: frontend
+        env:
+          VITE_BASE_PATH: "/ci-cd-pipeline-showcase/"
+          VITE_APP_VERSION: ${{ needs.build-image.outputs.version }}
+          VITE_COMMIT_SHA: ${{ github.sha }}
+          VITE_BUILD_TIME: ${{ steps.meta-info.outputs.build_time || '2026-11-04T00:00:00Z' }}
+          VITE_API_URL: ${{ vars.STAGING_API_URL || '' }}
+        run: npm run build
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ========================================================
+  # Job: Deploy Backend to Staging Environment
+  # Calls Render-style deploy hook if configured, waits for healthcheck,
+  # and verifies SHA provenance. Cleanly skips if no secret is present.
+  # ========================================================
+  deploy-backend-staging:
+    name: Deploy Backend (Staging)
+    needs: [build-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    steps:
+      - name: Trigger staging deployment hook and verify health
+        env:
+          DEPLOY_HOOK: ${{ secrets.STAGING_DEPLOY_HOOK_URL }}
+          API_URL: ${{ vars.STAGING_API_URL }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "Staging backend deploy skipped: no deploy hook configured (STAGING_DEPLOY_HOOK_URL secret not set)."
+            echo "### ℹ️ Staging Backend Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "Staging backend deploy skipped: no deploy hook configured." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "Triggering staging deployment webhook..."
+          curl -s -f -X POST "$DEPLOY_HOOK"
+
+          if [ -z "$API_URL" ]; then
+            echo "STAGING_API_URL variable is not set; skipping live health check."
+            exit 0
+          fi
+
+          echo "Awaiting healthy response from $API_URL/health (up to 10 attempts)..."
+          ATTEMPT=0
+          MAX_ATTEMPTS=10
+          DELAY=15
+          SUCCESS=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS: Checking $API_URL/health..."
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check passed with HTTP 200!"
+              SUCCESS=1
+              break
+            fi
+            echo "Returned status $STATUS. Retrying in $DELAY seconds..."
+            sleep $DELAY
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "❌ Backend healthcheck failed after $MAX_ATTEMPTS attempts."
+            exit 1
+          fi
+
+          echo "Verifying SHA provenance from $API_URL/version..."
+          DEPLOYED_SHA=$(curl -s "$API_URL/version" | grep -o '"commit_sha":"[^"]*' | cut -d'"' -f4 || true)
+          echo "Expected SHA: $EXPECTED_SHA"
+          echo "Deployed SHA: $DEPLOYED_SHA"
+          if [ "$DEPLOYED_SHA" != "$EXPECTED_SHA" ]; then
+            echo "⚠️ Notice: Deployed commit SHA does not match current commit yet (propagation delay)."
+          fi
+
+      - name: Generate deployment summary table
+        if: always()
+        run: |
+          echo "## 🚀 Staging Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Semantic Version** | \`${{ needs.build-image.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Git Commit** | \`${{ needs.build-image.outputs.short_sha }}\` (\`${{ github.sha }}\`) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Container Image** | \`${{ needs.build-image.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Staging Dashboard** | https://giftstack-dev.github.io/ci-cd-pipeline-showcase/ |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Staging API URL** | \`${{ vars.STAGING_API_URL || 'Not configured (demo mode active)' }}\` |" >> $GITHUB_STEP_SUMMARY
