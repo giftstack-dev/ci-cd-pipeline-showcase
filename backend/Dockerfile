@@ -1,7 +1,7 @@
 # ========================================================
 # Stage 1: Build virtualenv and install dependencies
 # ========================================================
-FROM python:3.12-slim AS builder
+FROM python:3.15-slim AS builder
 
 WORKDIR /build
 
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # ========================================================
 # Stage 2: Final runtime container
 # ========================================================
-FROM python:3.12-slim AS runner
+FROM python:3.15-slim AS runner
 
 # Create a non-root user and group
 RUN groupadd -r appgroup && useradd -r -g appgroup -u 10001 -d /app appuser
